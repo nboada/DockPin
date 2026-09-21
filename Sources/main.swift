@@ -6,10 +6,14 @@
 // 1. An event tap watches mouse movement. On every display except the main one,
 //    the cursor is kept a few points above the bottom edge, so the Dock never
 //    gets the "cursor pushed against the bottom" signal that makes it jump.
-// 2. On launch, on wake and when displays change, it checks where the Dock is.
-//    If it is not on the main display, it pushes the cursor against the bottom
-//    edge of the main display with synthetic mouse events, which pulls the Dock
-//    over. (Restarting the Dock does not help: it comes back where it was.)
+// 2. On launch, on wake (system sleep and display sleep) and when displays
+//    change, it checks where the Dock is. If it is not on the main display, it
+//    pushes the cursor against the bottom edge of the main display with
+//    synthetic mouse events, which pulls the Dock over. (Restarting the Dock
+//    does not help: it comes back where it was.) Each check is repeated a few
+//    times over the following seconds, and each push is verified and tried
+//    again if it did not take: right after a wake the displays are back before
+//    the Dock is ready to be moved.
 
 import AppKit
 import ServiceManagement
@@ -18,9 +22,14 @@ import ServiceManagement
 
 /// Points kept clear above the bottom edge of guarded displays.
 private let edgeBuffer: CGFloat = 4
-/// Safety valve so a misdetection can never cause a Dock restart loop.
+/// Safety valve so a misdetection can never cause an endless push loop. It
+/// counts triggered moves, not the retries inside one.
 private let maxAutoResets = 3
 private let autoResetWindow: TimeInterval = 600
+/// When to look again after a wake or a display change. The displays, the Dock
+/// and WindowServer each settle at their own pace, so one reading is not enough.
+private let wakeChecks: [TimeInterval] = [3, 6, 10, 20]
+private let displayChangeChecks: [TimeInterval] = [2, 5, 10]
 
 // MARK: - Log
 
@@ -65,7 +74,8 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var tap: CFMachPort?
     private var tapSource: CFRunLoopSource?
     private var trustTimer: Timer?
-    private var pendingEvaluate: DispatchWorkItem?
+    private var pendingChecks: [DispatchWorkItem] = []
+    private var pendingRetry: DispatchWorkItem?
 
     private var allBounds: [CGRect] = []
     private var guarded: [CGRect] = []
@@ -73,8 +83,9 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastDisplayIDs: Set<CGDirectDisplayID> = []
     private var dockAtBottom = true
     private var paused = false
-    private var autoResets: [Date] = []
+    private var budget = MoveBudget(limit: maxAutoResets, window: autoResetWindow)
     private var moving = false
+    private var moveAttempt = 0
 
     // MARK: Lifecycle
 
@@ -91,6 +102,11 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(didWake),
             name: NSWorkspace.didWakeNotification, object: nil)
+        // A laptop that only turns its displays off never posts didWake, and
+        // the Dock still ends up on the wrong screen when they come back.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(didWake),
+            name: NSWorkspace.screensDidWakeNotification, object: nil)
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(displaysChanged),
             name: NSNotification.Name("com.apple.dock.prefchanged"), object: nil)
@@ -99,8 +115,8 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ensureTap(prompt: true)
     }
 
-    @objc private func displaysChanged() { scheduleEvaluate(after: 2.0) }
-    @objc private func didWake() { scheduleEvaluate(after: 4.0) }
+    @objc private func displaysChanged() { scheduleEvaluate(after: displayChangeChecks) }
+    @objc private func didWake() { scheduleEvaluate(after: wakeChecks) }
 
     // MARK: Cursor guard
 
@@ -175,7 +191,7 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
             trustTimer = nil
             // Posting the synthetic push needs the same permission, so check
             // the Dock once we have it.
-            scheduleEvaluate(after: 1.0)
+            scheduleEvaluate(after: [1.0])
         } else if trustTimer == nil {
             // Trusted but the tap was refused. Usually fixed by a relaunch,
             // keep retrying in the meantime.
@@ -228,11 +244,15 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Dock placement
 
-    private func scheduleEvaluate(after delay: TimeInterval) {
-        pendingEvaluate?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.evaluate() }
-        pendingEvaluate = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    /// Drops any checks already queued and queues a fresh set, so a burst of
+    /// notifications coalesces into one sequence.
+    private func scheduleEvaluate(after delays: [TimeInterval]) {
+        pendingChecks.forEach { $0.cancel() }
+        pendingChecks = delays.map { delay in
+            let work = DispatchWorkItem { [weak self] in self?.evaluate() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+            return work
+        }
     }
 
     private func evaluate() {
@@ -259,27 +279,36 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func moveDockToMain(automatic: Bool) {
         if moving { return }
         if automatic {
-            let now = Date()
-            autoResets = autoResets.filter { now.timeIntervalSince($0) < autoResetWindow }
-            guard autoResets.count < maxAutoResets else {
+            // A move already under way is still working its way through its
+            // retries, so leave it to finish.
+            if pendingRetry != nil { return }
+            guard budget.allow() else {
                 dpLog("too many automatic Dock moves, skipping this one")
                 return
             }
-            autoResets.append(now)
+        } else {
+            pendingRetry?.cancel()
+            pendingRetry = nil
         }
+        moveAttempt = 0
+        push()
+    }
 
+    /// One push, followed by a look at where the Dock actually ended up. A push
+    /// made just after a wake often does not take, so a miss is tried again a
+    /// little later and a little further along the edge.
+    private func push() {
         let b = CGDisplayBounds(CGMainDisplayID())
         // The push only works on a stretch of edge with no display below it.
-        let step = max(1, b.width / 64)
-        let candidates = stride(from: b.minX + 20, to: b.maxX - 20, by: step)
-        guard let x = candidates.first(where: { x in
-            !allBounds.contains { $0.contains(CGPoint(x: x, y: b.maxY + 1)) }
-        }) else {
+        let positions = DockMovePlan.pushPositions(main: b, others: allBounds)
+        guard !positions.isEmpty else {
             dpLog("the main display has another display along its whole bottom edge, cannot move the Dock there")
             return
         }
+        let x = positions[moveAttempt % positions.count]
+        moveAttempt += 1
 
-        dpLog("moving Dock: pushing at x=\(Int(x)) on main display bounds \(b)")
+        dpLog("moving Dock: attempt \(moveAttempt) pushing at x=\(Int(x)) on main display bounds \(b)")
         moving = true
         let bottom = b.maxY - 1
         let original = CGEvent(source: nil)?.location
@@ -306,8 +335,34 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                 guard let self = self else { return }
                 self.moving = false
-                dpLog("after move: Dock on display \(self.displayShowingDock().map(String.init) ?? "unknown (auto hide)")")
+                self.checkMoveLanded()
             }
+        }
+    }
+
+    /// Reads the Dock's position after a push and books another attempt when it
+    /// is still on the wrong display.
+    private func checkMoveLanded() {
+        let dock = displayShowingDock()
+        let place = dock.map(String.init) ?? "unknown"
+        switch DockMovePlan.outcome(dockDisplay: dock, mainDisplay: CGMainDisplayID()) {
+        case .landed:
+            dpLog("after move: Dock on display \(place)")
+        case .unverifiable:
+            dpLog("after move: Dock auto hides, its display cannot be read")
+        case .missed:
+            guard let delay = DockMovePlan.retryDelay(afterAttempt: moveAttempt) else {
+                dpLog("after move: Dock still on display \(place) after \(moveAttempt) attempts, giving up")
+                return
+            }
+            dpLog("after move: Dock still on display \(place), trying again in \(delay)s")
+            let work = DispatchWorkItem { [weak self] in
+                guard let self = self else { return }
+                self.pendingRetry = nil
+                self.push()
+            }
+            pendingRetry = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
         }
     }
 
@@ -370,7 +425,7 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func togglePause() {
         paused.toggle()
         updateIcon()
-        if !paused { scheduleEvaluate(after: 0.5) }
+        if !paused { scheduleEvaluate(after: [0.5]) }
     }
 
     @objc private func toggleLogin() {
