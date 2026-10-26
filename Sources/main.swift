@@ -24,8 +24,8 @@ import ServiceManagement
 private let edgeBuffer: CGFloat = 4
 /// Safety valve so a misdetection can never cause an endless push loop. It
 /// counts triggered moves, not the retries inside one.
-private let maxAutoResets = 3
-private let autoResetWindow: TimeInterval = 600
+private let maxAutoMoves = 3
+private let autoMoveWindow: TimeInterval = 600
 /// When to look again after a wake or a display change. The displays, the Dock
 /// and WindowServer each settle at their own pace, so one reading is not enough.
 private let wakeChecks: [TimeInterval] = [3, 6, 10, 20]
@@ -45,6 +45,79 @@ func dpLog(_ message: String) {
         h.seekToEndOfFile(); h.write(data); try? h.close()
     } else {
         try? data.write(to: logURL)
+    }
+}
+
+// MARK: - Dock move plan
+
+/// Sliding-window allowance for automatic Dock moves. Retries inside one move
+/// do not go through this, so a move that is already trying does not use up
+/// the budget.
+private struct MoveBudget {
+    let limit: Int
+    let window: TimeInterval
+    private var moves: [Date] = []
+
+    init(limit: Int, window: TimeInterval) {
+        self.limit = limit
+        self.window = window
+    }
+
+    /// Records a move and returns whether it is allowed under the limit.
+    mutating func allow(now: Date = Date()) -> Bool {
+        moves.removeAll { now.timeIntervalSince($0) >= window }
+        guard moves.count < limit else { return false }
+        moves.append(now)
+        return true
+    }
+}
+
+private enum DockMoveOutcome {
+    case landed
+    case missed
+    case unverifiable
+}
+
+/// Pure decisions around moving the Dock, kept apart from the cursor work so
+/// the placement rules are easy to read and reason about.
+private enum DockMovePlan {
+    /// X positions along the main display's bottom edge that a push can use.
+    /// A push only moves the Dock on a stretch of edge with no display below
+    /// it, so those stretches are filtered out. Positions are ordered from the
+    /// middle of the display outwards: the Dock is centred there, so the first
+    /// push has the best chance and later attempts work their way out.
+    static func pushPositions(main: CGRect, others: [CGRect]) -> [CGFloat] {
+        let inset: CGFloat = 20
+        guard main.width > inset * 2 else { return [] }
+        let step = max(main.width / 64, 1)
+        var positions: [CGFloat] = []
+
+        var x = main.minX + inset
+        while x < main.maxX - inset {
+            let below = CGPoint(x: x, y: main.maxY + 1)
+            if !others.contains(where: { $0.contains(below) }) {
+                positions.append(x)
+            }
+            x += step
+        }
+
+        let midX = main.midX
+        return positions.sorted { abs($0 - midX) < abs($1 - midX) }
+    }
+
+    static func outcome(dockDisplay: CGDirectDisplayID?,
+                        mainDisplay: CGDirectDisplayID) -> DockMoveOutcome {
+        guard let dockDisplay = dockDisplay else { return .unverifiable }
+        return dockDisplay == mainDisplay ? .landed : .missed
+    }
+
+    /// Delay before the next push, or nil once the attempts are used up.
+    /// Pushing again too soon tends to miss, so each delay is longer than the
+    /// last. Five pushes in total, spread over about half a minute.
+    static func retryDelay(afterAttempt attempt: Int) -> TimeInterval? {
+        let delays: [TimeInterval] = [1.5, 3.0, 5.0, 8.0]
+        guard attempt >= 1, attempt <= delays.count else { return nil }
+        return delays[attempt - 1]
     }
 }
 
@@ -74,6 +147,7 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var tap: CFMachPort?
     private var tapSource: CFRunLoopSource?
     private var trustTimer: Timer?
+    private var healthTimer: Timer?
     private var pendingChecks: [DispatchWorkItem] = []
     private var pendingRetry: DispatchWorkItem?
 
@@ -83,9 +157,12 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastDisplayIDs: Set<CGDirectDisplayID> = []
     private var dockAtBottom = true
     private var paused = false
-    private var budget = MoveBudget(limit: maxAutoResets, window: autoResetWindow)
+    private var budget = MoveBudget(limit: maxAutoMoves, window: autoMoveWindow)
     private var moving = false
     private var moveAttempt = 0
+    /// Bumped when pending work is abandoned, so a push that was already in
+    /// flight does not book another retry when it finishes.
+    private var moveGeneration = 0
 
     // MARK: Lifecycle
 
@@ -113,6 +190,12 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         refreshDisplays()
         ensureTap(prompt: true)
+
+        // Watch a tap that is already running: permission can be revoked
+        // without relaunching the app, which leaves the icon looking active.
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.checkTapHealth()
+        }
     }
 
     @objc private func displaysChanged() { scheduleEvaluate(after: displayChangeChecks) }
@@ -200,6 +283,53 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         updateIcon()
+    }
+
+    /// Checks that the existing tap is still trusted and enabled. The event tap
+    /// callback handles a timeout, but a permission change can disable the tap
+    /// for good without any further callback.
+    private func checkTapHealth() {
+        guard let tap = tap else { return }
+
+        guard AXIsProcessTrusted() else {
+            dpLog("accessibility permission revoked, dropping the event tap")
+            dropTap()
+            return
+        }
+
+        guard !CGEvent.tapIsEnabled(tap: tap) else { return }
+        CGEvent.tapEnable(tap: tap, enable: true)
+        if !CGEvent.tapIsEnabled(tap: tap) {
+            dpLog("event tap disabled, dropping it")
+            dropTap()
+        }
+    }
+
+    /// Tears down a tap that cannot work any more and goes back to waiting for
+    /// permission. A push already in flight is left to restore the cursor, but
+    /// its completion will not book another attempt.
+    private func dropTap() {
+        if let tap = tap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+            if let source = tapSource {
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+            }
+            CFMachPortInvalidate(tap)
+        }
+        tap = nil
+        tapSource = nil
+        moveGeneration += 1
+        pendingChecks.forEach { $0.cancel() }
+        pendingChecks.removeAll()
+        pendingRetry?.cancel()
+        pendingRetry = nil
+        updateIcon()
+
+        if trustTimer == nil {
+            trustTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+                self?.ensureTap(prompt: false)
+            }
+        }
     }
 
     // MARK: Displays
@@ -312,6 +442,7 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
         moving = true
         let bottom = b.maxY - 1
         let original = CGEvent(source: nil)?.location
+        let generation = moveGeneration
         // Post from a background queue: the event tap runs on the main run loop
         // and must keep up with these events.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -335,6 +466,9 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                 guard let self = self else { return }
                 self.moving = false
+                // Paused or dropped while the push was in flight: do not book
+                // another attempt.
+                guard generation == self.moveGeneration else { return }
                 self.checkMoveLanded()
             }
         }
@@ -343,6 +477,7 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Reads the Dock's position after a push and books another attempt when it
     /// is still on the wrong display.
     private func checkMoveLanded() {
+        guard !paused else { return }
         let dock = displayShowingDock()
         let place = dock.map(String.init) ?? "unknown"
         switch DockMovePlan.outcome(dockDisplay: dock, mainDisplay: CGMainDisplayID()) {
@@ -359,6 +494,7 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let work = DispatchWorkItem { [weak self] in
                 guard let self = self else { return }
                 self.pendingRetry = nil
+                guard !self.paused else { return }
                 self.push()
             }
             pendingRetry = work
@@ -389,6 +525,9 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        // Refresh the permission state so the menu is accurate even if it is
+        // opened between health checks.
+        checkTapHealth()
         menu.removeAllItems()
 
         let status = NSMenuItem(title: statusLine(), action: nil, keyEquivalent: "")
@@ -399,7 +538,10 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if tap == nil {
             menu.addItem(item("Open Accessibility Settings…", #selector(openAccessibility)))
         }
-        menu.addItem(item("Move Dock to Main Display Now", #selector(moveNow)))
+        let move = item("Move Dock to Main Display Now", #selector(moveNow))
+        // The push needs the same permission as the tap.
+        move.isEnabled = tap != nil
+        menu.addItem(move)
 
         let pause = item("Pause", #selector(togglePause))
         pause.state = paused ? .on : .off
@@ -424,8 +566,21 @@ final class DockPin: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func togglePause() {
         paused.toggle()
+        if paused {
+            // Do not let a retry sequence keep warping the cursor after the
+            // user asks for it to stop.
+            moveGeneration += 1
+            pendingChecks.forEach { $0.cancel() }
+            pendingChecks.removeAll()
+            pendingRetry?.cancel()
+            pendingRetry = nil
+        } else {
+            // A push that was in flight at pause time may still be finishing,
+            // so look again after it has had a chance to clear.
+            scheduleEvaluate(after: [0.5, 3.0])
+        }
         updateIcon()
-        if !paused { scheduleEvaluate(after: [0.5]) }
+        dpLog(paused ? "paused" : "resumed")
     }
 
     @objc private func toggleLogin() {
